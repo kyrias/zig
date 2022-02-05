@@ -4295,6 +4295,20 @@ fn lowerDeclRef(self: *Self, tv: TypedValue, decl: *Module.Decl) InnerError!MCVa
     _ = tv;
 }
 
+fn lowerConst(self: *Self, tv: TypedValue) InnerError!MCValue {
+    if (self.bin_file.cast(link.File.Elf)) |elf_file| {
+        elf_file.updateConst(tv.ty, tv.val, self.src_loc) catch |err| {
+            log.err("updateConst error: {s}", .{@errorName(err)});
+            return error.CodegenFail;
+        };
+        const atom = elf_file.const_table.get(tv.ty).?;
+        const vaddr = elf_file.getAtomVAddr(atom);
+        return MCValue{ .memory = vaddr };
+    } else {
+        return self.fail("TODO lower const", .{});
+    }
+}
+
 fn genTypedValue(self: *Self, typed_value: TypedValue) InnerError!MCValue {
     if (typed_value.val.isUndef())
         return MCValue{ .undef = {} };
@@ -4409,6 +4423,9 @@ fn genTypedValue(self: *Self, typed_value: TypedValue) InnerError!MCValue {
             }
 
             return self.fail("TODO implement error union const of type '{}' (error)", .{typed_value.ty});
+        },
+        .Struct => {
+            return self.lowerConst(typed_value);
         },
         else => return self.fail("TODO implement const of type '{}'", .{typed_value.ty}),
     }

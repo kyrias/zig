@@ -127,6 +127,8 @@ error_flags: File.ErrorFlags = File.ErrorFlags{},
 atoms: std.AutoHashMapUnmanaged(u16, *TextBlock) = .{},
 atom_free_lists: std.AutoHashMapUnmanaged(u16, std.ArrayListUnmanaged(*TextBlock)) = .{},
 decls: std.AutoHashMapUnmanaged(*Module.Decl, ?u16) = .{},
+managed_atoms: std.ArrayListUnmanaged(*TextBlock) = .{},
+const_table: ConstTable = .{},
 
 /// A list of `SrcFn` whose Line Number Programs have surplus capacity.
 /// This is the same concept as `text_block_free_list`; see those doc comments.
@@ -139,6 +141,13 @@ dbg_line_fn_last: ?*SrcFn = null,
 dbg_info_decl_free_list: std.AutoHashMapUnmanaged(*TextBlock, void) = .{},
 dbg_info_decl_first: ?*TextBlock = null,
 dbg_info_decl_last: ?*TextBlock = null,
+
+pub const ConstTable = std.HashMapUnmanaged(
+    Type,
+    *TextBlock,
+    Type.HashContext64,
+    std.hash_map.default_max_load_percentage,
+);
 
 /// When allocating, the ideal_capacity is calculated by
 /// actual_capacity + (actual_capacity / ideal_factor)
@@ -341,12 +350,22 @@ pub fn deinit(self: *Elf) void {
         }
         self.atom_free_lists.deinit(self.base.allocator);
     }
+
+    for (self.managed_atoms.items) |atom| {
+        self.base.allocator.destroy(atom);
+    }
+    self.managed_atoms.deinit(self.base.allocator);
+    self.const_table.deinit(self.base.allocator);
 }
 
 pub fn getDeclVAddr(self: *Elf, decl: *const Module.Decl) u64 {
     assert(self.llvm_object == null);
-    assert(decl.link.elf.local_sym_index != 0);
-    return self.local_symbols.items[decl.link.elf.local_sym_index].st_value;
+    return self.getAtomVAddr(&decl.link.elf);
+}
+
+pub fn getAtomVAddr(self: *Elf, atom: *const TextBlock) u64 {
+    assert(atom.local_sym_index != 0);
+    return self.local_symbols.items[atom.local_sym_index].st_value;
 }
 
 fn getDebugLineProgramOff(self: Elf) u32 {
@@ -2516,7 +2535,6 @@ fn updateDeclCode(self: *Elf, decl: *Module.Decl, code: []const u8, stt_bits: u8
         const vaddr = try self.allocateTextBlock(&decl.link.elf, code.len, required_alignment, phdr_index);
         errdefer self.freeTextBlock(&decl.link.elf, phdr_index);
         log.debug("allocated text block for {s} at 0x{x}", .{ decl_name, vaddr });
-        errdefer self.freeTextBlock(&decl.link.elf, phdr_index);
 
         local_sym.* = .{
             .st_name = name_str_index,
@@ -2883,6 +2901,89 @@ pub fn updateDecl(self: *Elf, module: *Module, decl: *Module.Decl) !void {
 
     _ = try self.updateDeclCode(decl, code, elf.STT_OBJECT);
     return self.finishUpdateDecl(module, decl, &dbg_info_type_relocs, &dbg_info_buffer);
+}
+
+pub fn updateConst(self: *Elf, ty: Type, val: Value, src_loc: Module.SrcLoc) !void {
+    var code_buffer = std.ArrayList(u8).init(self.base.allocator);
+    defer code_buffer.deinit();
+
+    const res = try codegen.generateSymbol(&self.base, src_loc, .{
+        .ty = ty,
+        .val = val,
+    }, &code_buffer, .{ .none = .{} });
+    const code = switch (res) {
+        .externally_managed => |x| x,
+        .appended => code_buffer.items,
+        .fail => |em| {
+            log.err("updateConst error: {s}", .{em});
+            unreachable; // TODO
+        },
+    };
+
+    const atom = try self.base.allocator.create(TextBlock);
+    errdefer self.base.allocator.destroy(atom);
+    atom.* = TextBlock.empty;
+    try self.managed_atoms.append(self.base.allocator, atom);
+
+    const name = "unnamed";
+    try self.local_symbols.ensureUnusedCapacity(self.base.allocator, 1);
+    try self.offset_table.ensureUnusedCapacity(self.base.allocator, 1);
+
+    if (self.local_symbol_free_list.popOrNull()) |i| {
+        log.debug("reusing symbol index {d} for {s}", .{ i, name });
+        atom.local_sym_index = i;
+    } else {
+        log.debug("allocating symbol index {d} for {s}", .{ self.local_symbols.items.len, name });
+        atom.local_sym_index = @intCast(u32, self.local_symbols.items.len);
+        _ = self.local_symbols.addOneAssumeCapacity();
+    }
+
+    // if (self.offset_table_free_list.popOrNull()) |i| {
+    //     atom.offset_table_index = i;
+    // } else {
+    //     atom.offset_table_index = @intCast(u32, self.offset_table.items.len);
+    //     _ = self.offset_table.addOneAssumeCapacity();
+    //     self.offset_table_count_dirty = true;
+    // }
+
+    self.local_symbols.items[atom.local_sym_index] = .{
+        .st_name = 0,
+        .st_info = 0,
+        .st_other = 0,
+        .st_shndx = 0,
+        .st_value = 0,
+        .st_size = 0,
+    };
+    // self.offset_table.items[atom.offset_table_index] = 0;
+
+    const required_alignment = ty.abiAlignment(self.base.options.target);
+    // TODO name
+    const phdr_index = self.phdr_load_ro_index.?;
+    const shdr_index = self.phdr_shdr_table.get(phdr_index).?;
+    const name_str_index = try self.makeString("unnamed");
+    const vaddr = try self.allocateTextBlock(atom, code.len, required_alignment, phdr_index);
+    errdefer self.freeTextBlock(atom, phdr_index);
+    log.debug("allocated text block for {s} at 0x{x}", .{ name, vaddr });
+
+    const local_sym = &self.local_symbols.items[atom.local_sym_index];
+    local_sym.* = .{
+        .st_name = name_str_index,
+        .st_info = (elf.STB_LOCAL << 4) | elf.STT_OBJECT,
+        .st_other = 0,
+        .st_shndx = shdr_index,
+        .st_value = vaddr,
+        .st_size = code.len,
+    };
+    // self.offset_table.items[atom.offset_table_index] = vaddr;
+
+    try self.writeSymbol(atom.local_sym_index);
+    // try self.writeOffsetTableEntry(atom.offset_table_index);
+    // TODO make this an index
+    try self.const_table.putNoClobber(self.base.allocator, ty, atom);
+
+    const section_offset = local_sym.st_value - self.program_headers.items[phdr_index].p_vaddr;
+    const file_offset = self.sections.items[shdr_index].sh_offset + section_offset;
+    try self.base.file.?.pwriteAll(code, file_offset);
 }
 
 /// Asserts the type has codegen bits.
